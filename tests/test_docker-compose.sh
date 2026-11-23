@@ -1222,6 +1222,175 @@ test_wait_healthy_exited() {
 }
 tests+=(test_wait_healthy_exited)
 
+# Helpers for the MULTIPLE_PROJECTS tests below
+prepare_docker_mock_ref_ids() {
+    prepare_docker_mock
+    # 'docker images ...' returns the queried image reference as its ID
+    cat << EOF > "${WORKDIR}/bin/docker"
+#!/bin/bash
+case "\$1" in
+     --version|version)
+        exit 0
+        ;;
+     compose)
+        exit 1
+        ;;
+     images)
+        echo "\$4"
+        ;;
+     inspect)
+        shift 3
+        for container_id in "\$@"; do
+            echo "running:no_check"
+        done
+        exit 0
+        ;;
+esac
+echo "\$(basename \$0) \$@" >> "$CMDLINE_LOGGER_LOG_FILE"
+exit 0
+EOF
+}
+
+# $1 -- project name, $2 -- artifact name, $3 -- manifest contents
+set_artifact() {
+    rm -rf "${WORKDIR}/artifact-file-tree/tmp/"*
+    cat << EOF > "${WORKDIR}/artifact-file-tree/header/meta-data"
+{"version": "1", "project_name": "$1"}
+EOF
+    cat << EOF > "${WORKDIR}/artifact-file-tree/header/header-info"
+{
+  "artifact_provides": { "artifact_name": "$2" }
+}
+EOF
+    echo "$3" > "${WORKDIR}/manifests/docker-compose.yml"
+    tar -C "${WORKDIR}" -cf "${WORKDIR}/artifact-file-tree/files/manifests.tar" manifests
+}
+
+# Runs ArtifactInstall, ArtifactCommit and Cleanup for the current artifact
+install_commit_cleanup() {
+    local state rc=0
+    for state in ArtifactInstall ArtifactCommit Cleanup; do
+        "${SRCDIR}/docker-compose" $state "${WORKDIR}/artifact-file-tree" >> "${WORKDIR}/docker-compose.log" 2>&1 || rc=$?
+        if [ $rc -ne 0 ]; then
+            echo "$state failed (exit code $rc), logs follow:"
+            cat "${WORKDIR}/docker-compose.log"
+            return $rc
+        fi
+    done
+}
+
+test_multiple_projects_side_by_side_cleanup() {
+    local rc=0
+
+    prepare_config
+    echo "MULTIPLE_PROJECTS=yes" >> "$MENDER_DOCKER_COMPOSE_CONFIG_FILE"
+    prepare_expected_file_tree
+    prepare_docker_mock_ref_ids
+
+    # First project uses the images from prepare_expected_file_tree
+    install_commit_cleanup || return $?
+
+    # Second project shares bad/php:oldest with the first one
+    set_artifact other-comp other-artifact "services:
+  db:
+    image: some/db:1
+  php:
+    image: bad/php:oldest"
+    install_commit_cleanup || return $?
+
+    # Update of the second project drops both of its images, only some/db:1 can
+    # be removed, bad/php:oldest is still used by the first project
+    set_artifact other-comp other-artifact2 "services:
+  db:
+    image: some/db:2"
+    install_commit_cleanup || return $?
+
+    cat << EOF | diff -u - "$CMDLINE_LOGGER_LOG_FILE" || rc=$?
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image1.tar
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image2.tar
+docker images --format {{json .ID}} some/lighttpd:latest
+docker images --format {{json .ID}} bad/php:oldest
+docker-compose --project-name test-comp up --detach
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image1.tar
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image2.tar
+docker images --format {{json .ID}} some/db:1
+docker images --format {{json .ID}} bad/php:oldest
+docker-compose --project-name other-comp up --detach
+docker-compose --project-name other-comp down
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image1.tar
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image2.tar
+docker images --format {{json .ID}} some/db:2
+docker-compose --project-name other-comp up --detach
+docker rmi --force some/db:1
+EOF
+    if [ $rc -ne 0 ]; then
+        echo "Unexpected commands executed (see the above diff), logs follow:"
+        cat "${WORKDIR}/docker-compose.log"
+        return $rc
+    fi
+
+    local project
+    for project in test-comp other-comp; do
+        if ! [ -d "${PERSISTENT_DIR}/projects/${project}/current" ]; then
+            echo "'current' directory doesn't exist for ${project}"
+            return 1
+        fi
+    done
+    if [ -e "${PERSISTENT_DIR}/current" ]; then
+        echo "top-level 'current' directory exists with MULTIPLE_PROJECTS=yes"
+        return 1
+    fi
+
+    return $rc
+}
+tests+=(test_multiple_projects_side_by_side_cleanup)
+
+test_multiple_projects_migrate_existing() {
+    local rc=0
+
+    prepare_config
+    prepare_expected_file_tree
+    prepare_docker_mock_ref_ids
+
+    # Installed without MULTIPLE_PROJECTS
+    install_commit_cleanup || return $?
+
+    echo "MULTIPLE_PROJECTS=yes" >> "$MENDER_DOCKER_COMPOSE_CONFIG_FILE"
+    set_artifact other-comp other-artifact "services:
+  db:
+    image: some/db:1"
+    install_commit_cleanup || return $?
+
+    cat << EOF | diff -u - "$CMDLINE_LOGGER_LOG_FILE" || rc=$?
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image1.tar
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image2.tar
+docker images --format {{json .ID}} some/lighttpd:latest
+docker images --format {{json .ID}} bad/php:oldest
+docker-compose --project-name test-comp up --detach
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image1.tar
+docker image load --input ${WORKDIR}/artifact-file-tree/tmp/images/image2.tar
+docker images --format {{json .ID}} some/db:1
+docker-compose --project-name other-comp up --detach
+EOF
+    if [ $rc -ne 0 ]; then
+        echo "Unexpected commands executed (see the above diff), logs follow:"
+        cat "${WORKDIR}/docker-compose.log"
+        return $rc
+    fi
+
+    if ! [ -f "${PERSISTENT_DIR}/projects/test-comp/current/project_name" ]; then
+        echo "existing composition wasn't moved to projects/test-comp"
+        return 1
+    fi
+    if [ -e "${PERSISTENT_DIR}/current" ]; then
+        echo "top-level 'current' directory still exists after the migration"
+        return 1
+    fi
+
+    return $rc
+}
+tests+=(test_multiple_projects_migrate_existing)
+
 n_ok=0
 n_fail=0
 for ((i = 0; i < ${#tests[@]}; i++)); do

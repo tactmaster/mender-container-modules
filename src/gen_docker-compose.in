@@ -35,7 +35,7 @@ Simple tool to generate Mender Artifacts suitable for the docker-compose module
 
 Usage: $0 [options] [-- [options-for-mender-artifact] ]
 
-    Options: [ -n|--artifact-name -t|--device-type -o|--output_path -a|--architecture -l|--list-architectures -i|--images-dir -m|--manifests-dir -h|--help -p|--project-name]
+    Options: [ -n|--artifact-name -t|--device-type -o|--output_path -a|--architecture -l|--list-architectures -i|--images-dir -m|--manifests-dir -h|--help -p|--project-name --multiple-projects]
 
         --artifact-name      - Artifact name
         --device-type        - Target device type identification (can be given more than once)
@@ -45,6 +45,8 @@ Usage: $0 [options] [-- [options-for-mender-artifact] ]
         --images-dir         - Directory containing container images the composition needs
         --manifests-dir      - Directory containing docker compose manifests
         --project-name       - Name of the docker compose project, must contain only characters from the class $PROJECT_NAME_ALLOWED_REGEX
+        --multiple-projects  - Only replace the composition with the same project name on the device
+                               instead of any composition (requires MULTIPLE_PROJECTS=yes on the device)
         --help               - Show help and exit
 
 Anything after a '--' gets passed directly to the mender-artifact tool. See
@@ -61,7 +63,27 @@ parse_extra_argument() {
   return 1
 }
 
-parse_base_arguments "$@"
+# --multiple-projects is handled here, everything else by parse_base_arguments
+multiple_projects=false
+declare -a base_args
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --multiple-projects)
+            multiple_projects=true
+            shift
+            ;;
+        --)
+            base_args+=("$@")
+            break
+            ;;
+        *)
+            base_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+parse_base_arguments "${base_args[@]}"
 output_path="${output_path:-docker-compose-artifact.mender}"
 version="1.0"
 
@@ -98,9 +120,14 @@ software_name="${software_name_prefix}${project_name}"
 composition_sum=$(echo "$project_name" "$images_sum" "$manifests_sum" | sha256_digest)
 checksum_provides_key="${software_name}.checksum"
 
-# There can only be one project handled by the docker-compose Update Module so
-# every new one installed removes any old installed before.
-clears_provides="*${software_name_prefix}*"
+# By default, there can only be one project handled by the docker-compose Update
+# Module so every new one installed removes any old installed before. With
+# --multiple-projects, only the provides of the same project are cleared.
+if [ "$multiple_projects" = true ]; then
+    clears_provides="*${software_name}.*"
+else
+    clears_provides="*${software_name_prefix}*"
+fi
 
 mender-artifact write module-image \
     --type docker-compose \

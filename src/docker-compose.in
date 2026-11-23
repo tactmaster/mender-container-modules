@@ -35,6 +35,9 @@ TEMP_DIR="$FILES"/tmp
 
 # Can be overriden by mender-docker-compose.conf
 WAIT_TIMEOUT=120
+# Set to "yes" in mender-docker-compose.conf to keep compositions with different
+# project names side by side instead of replacing each other.
+MULTIPLE_PROJECTS="no"
 
 m4_include(docker-compose_base.sh)
 
@@ -86,24 +89,28 @@ case "$STATE" in
     ArtifactInstall)
         discover_requirements
         parse_metadata "$FILES"/header/meta-data "$FILES"/header/header-info
+        select_project_store
         install_artifact "$FILES"/files
         ;;
 
     ArtifactCommit)
         discover_requirements
         parse_metadata "$FILES"/header/meta-data "$FILES"/header/header-info
+        select_project_store
         commit_artifact
         ;;
 
     ArtifactRollback)
         discover_requirements
         parse_metadata "$FILES"/header/meta-data "$FILES"/header/header-info
+        select_project_store
         rollback_artifact
         ;;
 
     Cleanup)
         discover_requirements
         parse_metadata "$FILES"/header/meta-data "$FILES"/header/header-info
+        select_project_store
         cleanup
         ;;
 esac

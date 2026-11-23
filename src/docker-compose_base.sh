@@ -89,6 +89,51 @@ parse_metadata() {
     fi
 }
 
+PROJECTS_DIR=""
+
+# With MULTIPLE_PROJECTS=yes, every project gets its own store in
+# ${PERSISTENT_STORE}/projects/<project name> so that compositions with
+# different project names don't replace each other. Must be called after
+# parse_metadata.
+select_project_store() {
+    if [ "${MULTIPLE_PROJECTS}" != "yes" ]; then
+        return 0
+    fi
+
+    PROJECTS_DIR="${PERSISTENT_STORE}/projects"
+
+    # Move a composition installed while MULTIPLE_PROJECTS was not enabled
+    # into its project's store.
+    if [ -d "${PERSISTENT_STORE}/current" ]; then
+        local legacy_project=$(cat "${PERSISTENT_STORE}/current/project_name")
+        echo "moving existing composition to ${PROJECTS_DIR}/${legacy_project}"
+        mkdir -p "${PROJECTS_DIR}/${legacy_project}"
+        local entry
+        for entry in current previous cleanup uncommitted; do
+            if [ -e "${PERSISTENT_STORE}/${entry}" ]; then
+                mv -v "${PERSISTENT_STORE}/${entry}" "${PROJECTS_DIR}/${legacy_project}/"
+            fi
+        done
+    fi
+
+    PERSISTENT_STORE="${PROJECTS_DIR}/${PROJECT_NAME}"
+    mkdir -p "${PERSISTENT_STORE}"
+}
+
+# Outputs the IDs of the images used by the installed composition(s), i.e. the
+# images that must not be removed.
+installed_image_ids() {
+    local image_ids_file
+    for image_ids_file in "${PERSISTENT_STORE}/current/image_ids" "${PROJECTS_DIR:-/nonexistent}"/*/current/image_ids; do
+        if [ -f "$image_ids_file" ]; then
+            # $NF is the last field, i.e. the image ID regardless of whether
+            # the line also has a tag as its first field (new format) or not
+            # (old format).
+            awk '{print $NF}' "$image_ids_file"
+        fi
+    done
+}
+
 container_image_load() {
     local input_file="$1"
 
@@ -340,10 +385,8 @@ cleanup() {
             if [ -z "$image_id" ]; then
                 image_id="$image_ref"
             fi
-            # $NF is the last field, i.e. the image ID regardless of whether
-            # the line also has a tag as its first field (new format) or not
-            # (old format).
-            if ! awk '{print $NF}' "${PERSISTENT_STORE}/current/image_ids" 2> /dev/null | grep -qFx "$image_id"; then
+            # Images still used by any installed composition must be kept.
+            if ! installed_image_ids | grep -qFx "$image_id"; then
                 $DOCKER_CMD rmi --force "$image_id" || rc=1
             fi
         done < "${PERSISTENT_STORE}/cleanup/image_ids"
